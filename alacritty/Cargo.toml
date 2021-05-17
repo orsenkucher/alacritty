@@ -1,6 +1,10 @@
 [package]
 name = "alacritty"
+<<<<<<< HEAD
 version = "0.11.0-dev"
+=======
+version = "0.8.0"
+>>>>>>> a1b13e68 (Bump version to 0.8.0)
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "A fast, cross-platform, OpenGL terminal emulator"
@@ -11,7 +15,11 @@ rust-version = "1.57.0"
 
 [dependencies.alacritty_terminal]
 path = "../alacritty_terminal"
+<<<<<<< HEAD
 version = "0.17.0-dev"
+=======
+version = "0.14.0"
+>>>>>>> a1b13e68 (Bump version to 0.8.0)
 default-features = false
 
 [dependencies.alacritty_config_derive]
