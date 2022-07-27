@@ -136,13 +136,13 @@ pub fn reload(config_path: &Path, options: &Options) -> Result<UiConfig> {
     Ok(config)
 }
 
-/// Modifications after the `UiConfig` object is created.
-fn after_loading(config: &mut UiConfig, options: &Options) {
+/// Modifications after the `Config` object is created.
+fn after_loading(config: &mut Config, options: &Options) {
     // Override config with CLI options.
     options.override_config(config);
 
     // Create key bindings for regex hints.
-    config.generate_hint_bindings();
+    config.ui_config.generate_hint_bindings();
 }
 
 /// Load configuration file and log errors.
@@ -165,8 +165,8 @@ fn read_config(path: &Path, cli_config: Value) -> Result<UiConfig> {
     config_value = serde_utils::merge(config_value, cli_config);
 
     // Deserialize to concrete type.
-    let mut config = UiConfig::deserialize(config_value)?;
-    config.config_paths = config_paths;
+    let mut config = Config::deserialize(config_value)?;
+    config.ui_config.config_paths = config_paths;
 
     Ok(config)
 }

@@ -1058,7 +1058,217 @@ impl Mouse {
     }
 }
 
-impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+/// The event processor.
+///
+/// Stores some state from received events and dispatches actions when they are
+/// triggered.
+pub struct Processor<N> {
+    notifier: N,
+    mouse: Mouse,
+    received_count: usize,
+    suppress_chars: bool,
+    modifiers: ModifiersState,
+    config: Config,
+    message_buffer: MessageBuffer,
+    display: Display,
+    font_size: Size,
+    event_queue: Vec<GlutinEvent<'static, Event>>,
+    search_state: SearchState,
+    cli_options: CLIOptions,
+    dirty: bool,
+}
+
+impl<N: Notify + OnResize> Processor<N> {
+    /// Create a new event processor.
+    ///
+    /// Takes a writer which is expected to be hooked up to the write end of a PTY.
+    pub fn new(
+        notifier: N,
+        message_buffer: MessageBuffer,
+        config: Config,
+        display: Display,
+        cli_options: CLIOptions,
+    ) -> Processor<N> {
+        Processor {
+            font_size: config.ui_config.font.size(),
+            message_buffer,
+            cli_options,
+            notifier,
+            display,
+            config,
+            received_count: Default::default(),
+            suppress_chars: Default::default(),
+            search_state: Default::default(),
+            event_queue: Default::default(),
+            modifiers: Default::default(),
+            mouse: Default::default(),
+            dirty: Default::default(),
+        }
+    }
+
+    /// Return `true` if `event_queue` is empty, `false` otherwise.
+    #[inline]
+    #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+    fn event_queue_empty(&mut self) -> bool {
+        let wayland_event_queue = match self.display.wayland_event_queue.as_mut() {
+            Some(wayland_event_queue) => wayland_event_queue,
+            // Since frame callbacks do not exist on X11, just check for event queue.
+            None => return self.event_queue.is_empty(),
+        };
+
+        // Check for pending frame callbacks on Wayland.
+        let events_dispatched = wayland_event_queue
+            .dispatch_pending(&mut (), |_, _, _| {})
+            .expect("failed to dispatch event queue");
+
+        self.event_queue.is_empty() && events_dispatched == 0
+    }
+
+    /// Return `true` if `event_queue` is empty, `false` otherwise.
+    #[inline]
+    #[cfg(any(not(feature = "wayland"), target_os = "macos", windows))]
+    fn event_queue_empty(&mut self) -> bool {
+        self.event_queue.is_empty()
+    }
+
+    /// Run the event loop.
+    pub fn run<T>(&mut self, terminal: Arc<FairMutex<Term<T>>>, mut event_loop: EventLoop<Event>)
+    where
+        T: EventListener,
+    {
+        let mut scheduler = Scheduler::new();
+
+        // Start the initial cursor blinking timer.
+        if self.config.cursor.style().blinking {
+            let event: Event = TerminalEvent::CursorBlinkingChange(true).into();
+            self.event_queue.push(event.into());
+        }
+
+        // NOTE: Since this takes a pointer to the winit event loop, it MUST be dropped first.
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        let mut clipboard = unsafe { Clipboard::new(event_loop.wayland_display()) };
+        #[cfg(any(not(feature = "wayland"), target_os = "macos", windows))]
+        let mut clipboard = Clipboard::new();
+
+        event_loop.run_return(|event, event_loop, control_flow| {
+            if self.config.ui_config.debug.print_events {
+                info!("glutin event: {:?}", event);
+            }
+
+            // Ignore all events we do not care about.
+            if Self::skip_event(&event) {
+                return;
+            }
+
+            match event {
+                // Check for shutdown.
+                GlutinEvent::UserEvent(Event::TerminalEvent(TerminalEvent::Exit)) => {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                },
+                // Process events.
+                GlutinEvent::RedrawEventsCleared => {
+                    *control_flow = match scheduler.update(&mut self.event_queue) {
+                        Some(instant) => ControlFlow::WaitUntil(instant),
+                        None => ControlFlow::Wait,
+                    };
+
+                    if self.event_queue_empty() {
+                        return;
+                    }
+                },
+                // Remap DPR change event to remove lifetime.
+                GlutinEvent::WindowEvent {
+                    event: WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size },
+                    ..
+                } => {
+                    *control_flow = ControlFlow::Poll;
+                    let size = (new_inner_size.width, new_inner_size.height);
+                    self.event_queue.push(Event::DprChanged(scale_factor, size).into());
+                    return;
+                },
+                // Transmute to extend lifetime, which exists only for `ScaleFactorChanged` event.
+                // Since we remap that event to remove the lifetime, this is safe.
+                event => unsafe {
+                    *control_flow = ControlFlow::Poll;
+                    self.event_queue.push(mem::transmute(event));
+                    return;
+                },
+            }
+
+            let mut terminal = terminal.lock();
+
+            let mut display_update_pending = DisplayUpdate::default();
+            let old_is_searching = self.search_state.history_index.is_some();
+
+            let context = ActionContext {
+                terminal: &mut terminal,
+                notifier: &mut self.notifier,
+                mouse: &mut self.mouse,
+                clipboard: &mut clipboard,
+                received_count: &mut self.received_count,
+                suppress_chars: &mut self.suppress_chars,
+                modifiers: &mut self.modifiers,
+                message_buffer: &mut self.message_buffer,
+                display_update_pending: &mut display_update_pending,
+                display: &mut self.display,
+                font_size: &mut self.font_size,
+                config: &mut self.config,
+                scheduler: &mut scheduler,
+                search_state: &mut self.search_state,
+                cli_options: &self.cli_options,
+                dirty: &mut self.dirty,
+                event_loop,
+            };
+            let mut processor = input::Processor::new(context);
+
+            for event in self.event_queue.drain(..) {
+                Processor::handle_event(event, &mut processor);
+            }
+
+            // Process DisplayUpdate events.
+            if display_update_pending.dirty {
+                self.submit_display_update(&mut terminal, old_is_searching, display_update_pending);
+            }
+
+            // Skip rendering on Wayland until we get frame event from compositor.
+            #[cfg(not(any(target_os = "macos", windows)))]
+            if !self.display.is_x11 && !self.display.window.should_draw.load(Ordering::Relaxed) {
+                return;
+            }
+
+            if self.dirty || self.mouse.hint_highlight_dirty {
+                self.dirty |= self.display.update_highlighted_hints(
+                    &terminal,
+                    &self.config,
+                    &self.mouse,
+                    self.modifiers,
+                );
+                self.mouse.hint_highlight_dirty = false;
+            }
+
+            if self.dirty {
+                self.dirty = false;
+
+                // Request immediate re-draw if visual bell animation is not finished yet.
+                if !self.display.visual_bell.completed() {
+                    let event: Event = TerminalEvent::Wakeup.into();
+                    self.event_queue.push(event.into());
+
+                    *control_flow = ControlFlow::Poll;
+                }
+
+                // Redraw screen.
+                self.display.draw(terminal, &self.message_buffer, &self.config, &self.search_state);
+            }
+        });
+
+        // Write ref tests to disk.
+        if self.config.ui_config.debug.ref_test {
+            self.write_ref_test_results(&terminal.lock());
+        }
+    }
+
     /// Handle events from glutin.
     pub fn handle_event(&mut self, event: GlutinEvent<'_, Event>) {
         match event {

@@ -975,7 +975,7 @@ impl Display {
         let vi_highlighted_hint = if term.mode().contains(TermMode::VI) {
             let mods = ModifiersState::all();
             let point = term.vi_mode_cursor.point;
-            hint::highlighted_at(term, config, point, mods)
+            hint::highlighted_at(&term, config, point, mods)
         } else {
             None
         };
